@@ -4,6 +4,9 @@ import hashlib
 import os
 import typing
 from typing import Union, Tuple
+import enum
+
+from pwngrid_api.version import version
 
 import requests
 import cryptography
@@ -83,6 +86,29 @@ def decrypt(key, associated_data, iv, ciphertext, tag):
     return decryptor.update(ciphertext) + decryptor.finalize()
 
 
+class MessageMark(enum.Enum):
+    SEEN = "seen"
+    UNSEEN = "unseen"
+    DELETED = "deleted"
+    RESTORED = "restored"
+
+
+class PwngridException(Exception):
+    pass
+
+
+class PwngridSecurityError(PwngridException):
+    pass
+
+
+class PwngridClientError(PwngridException):
+    def __init__(self, message, error, response):
+        super().__init__(message)
+
+        self.error = error
+        self.response = response
+
+
 class Unit:
     def __init__(self, hostname, public_key, private_key=None):
         self.hostname = hostname
@@ -104,7 +130,10 @@ class Unit:
         )
 
         if fingerprint != data_public_key_fingerprint:
-            raise Exception("MITM")
+            raise PwngridSecurityError(
+                "Public key fingerprint DOES NOT match requested fingerprint!"
+                " Possible MITM?"
+            )
 
         public_key = serialization.load_pem_public_key(
             data["public_key"]
@@ -117,7 +146,7 @@ class Unit:
 
     def sign(self, data: bytes) -> bytes:
         if not self.private_key:
-            raise Exception("No private key")
+            raise PwngridException("No private key")
 
         return self.private_key.sign(
             data,
@@ -146,7 +175,7 @@ class Unit:
 
     def decrypt(self, ciphertext: bytes) -> bytes:
         if not self.private_key:
-            raise Exception("No private key")
+            raise PwngridException("No private key")
 
         return self.private_key.decrypt(
             ciphertext,
@@ -159,7 +188,7 @@ class Unit:
 
     def decrypt_message(self, from_unit: Unit, data: bytes, signature: bytes) -> bytes:
         if not self.private_key:
-            raise Exception("No private key")
+            raise PwngridException("No private key")
 
         from_unit.verify(signature, data)
 
@@ -179,7 +208,7 @@ class Unit:
 
     def encrypt_message(self, to_unit: Unit, plaintext: bytes) -> Tuple[bytes, bytes]:
         if not self.private_key:
-            raise Exception("No private key")
+            raise PwngridException("No private key")
 
         key = os.urandom(16)
         key_encrypted = to_unit.encrypt(key)
@@ -205,7 +234,7 @@ class Unit:
 class PwngridSession:
     def __init__(self, token=None):
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = "pwngrid-api-client"
+        self.session.headers["User-Agent"] = f"pwngrid-api python ({version})"
 
         if token:
             self.set_token(token)
@@ -215,10 +244,36 @@ class PwngridSession:
 
     def __call__(self, method, path, *args, **kwargs):
         url = f"https://api.pwnagotchi.ai/api/{path}"
-        return self.session.request(method, url, **kwargs).json()
+        response = self.session.request(method, url, **kwargs)
+
+        try:
+            json_data = response.json()
+        except:
+            json_data = None
+
+        not_ok = not response.ok or (
+            isinstance(json_data, dict) and "error" in json_data
+        )
+        if not_ok:
+            error = json_data.get("error") if isinstance(json_data, dict) else None
+            code = error or "error"
+            raise PwngridClientError(
+                f"[{response.status_code}] {code}", error=error, response=response
+            )
+
+        if json_data is None:
+            text = response.text[:50]
+            dots = "" if len(response.text) <= 50 else "..."
+            raise PwngridClientError(
+                f'no json data: "{text}{dots}"', error="no JSON data", response=response
+            )
+
+        return json_data
 
 
 class PwngridClient:
+    _units_cache = {}
+
     def __init__(self, hostname: str, private_key):
         self.hostname = hostname
         self.private_key = private_key
@@ -227,12 +282,18 @@ class PwngridClient:
 
         self.session = PwngridSession()
 
-    def enroll(self):
+    def clear_units_cache(self):
+        self._units_cache = {}
+
+    def enroll(self, data=None):
+        if data is None:
+            data = {}
+
         enroll_data = {
             "identity": self.unit.identity,
             "public_key": get_pub_key_pem_b64(self.unit.public_key),
             "signature": sign_b64(self.private_key, self.unit.identity.encode("ascii")),
-            "data": {"dunno": 1},
+            "data": data,
         }
 
         r = self.session("POST", "v1/unit/enroll", json=enroll_data)
@@ -249,17 +310,32 @@ class PwngridClient:
     def get_inbox(self, page: int = None) -> dict:
         return self.session("GET", "v1/unit/inbox", params={"p": page})
 
-    def mark_message(self, id: int, mark: str) -> dict:
-        return self.session("GET", "v1/unit/inbox/{id}/{mark}")
+    def mark_message(self, id: int, mark: Union[str, MessageMark]) -> dict:
+        if isinstance(mark, MessageMark):
+            mark = mark.value
+
+        return self.session("GET", f"v1/unit/inbox/{id}/{mark}")
 
     def report_ap(self, essid: str, bssid: str):
         return self.session(
             "POST", "v1/unit/report/ap", json={"essid": essid, "bssid": bssid}
         )
 
-    def get_unit_by_fingerprint(self, fingerprint: str) -> Unit:
-        r = self.session("GET", f"v1/unit/{fingerprint}")
-        return Unit.from_api_data(fingerprint, r)
+    def get_unit_by_fingerprint(
+        self, fingerprint: str, ignore_cache: bool = False
+    ) -> Unit:
+        if "@" in fingerprint:
+            fingerprint = fingerprint.split("@", 1)[-1]
+
+        if not ignore_cache:
+            cached_unit = self._units_cache.get(fingerprint)
+            if cached_unit:
+                return cached_unit
+
+        unit_data = self.session("GET", f"v1/unit/{fingerprint}")
+        unit = Unit.from_api_data(fingerprint, unit_data)
+        self._units_cache[fingerprint] = unit
+        return unit
 
     def read_message(self, id: int) -> Tuple[dict, bytes]:
         r = self.session("GET", f"v1/unit/inbox/{id}")
@@ -271,7 +347,7 @@ class PwngridClient:
         sender = self.get_unit_by_fingerprint(message["sender"])
         plaintext = self.unit.decrypt_message(sender, data, signature)
 
-        return message, plaintext
+        return message, plaintext, sender
 
     def send_message(self, recipient: Union[str, Unit], cleartext: bytes) -> dict:
         if not isinstance(recipient, Unit):

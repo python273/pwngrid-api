@@ -32,6 +32,6 @@ pwngrid.send_message(
 )
 
 for m in pwngrid.get_inbox()["messages"]:
-    data, cleartext = pwngrid.read_message(m["id"])
-    print(data["sender"], cleartext.decode("utf-8"))
+    data, cleartext, sender = pwngrid.read_message(m["id"])
+    print(sender.identity, cleartext.decode("utf-8"))
 ```
