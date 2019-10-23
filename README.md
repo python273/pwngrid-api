@@ -2,7 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/pwngrid-api.svg)](https://pypi.org/project/pwngrid-api/) ![Python 3.6, 3.7, 3.8](https://img.shields.io/pypi/pyversions/pwngrid-api.svg)
 
-[Pwnagotchi](Pwnagotchihttps://pwnagotchi.ai/)'s Pwngrid API client (⌐■_■)
+[Pwnagotchi](https://pwnagotchi.ai/)'s Pwngrid API client (⌐■_■)
 
 - https://pwnagotchi.ai/api/grid/
 
